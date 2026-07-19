@@ -1,0 +1,10 @@
+[build]
+  command = "node gerar-de-planilha.js"
+  publish = "deploy"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Variáveis a definir no painel do Netlify (Site settings → Environment variables):
+#   SHEET_CSV = URL da planilha publicada como CSV
+#   BLOG_BASE = https://www.bullseye.ind.br/blog   (opcional; já é o padrão)
