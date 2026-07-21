@@ -176,69 +176,65 @@ async function baixarCandidata(u) {
   const auto = arts.filter((a) => !a.fixa && (!a.imagem || isGoogleImg(a.imagem)));
   console.log(`Artigos: ${arts.length} | capa fixa no repo: ${fixas} | capa manual (planilha): ${arts.length - fixas - auto.length} | detecção automática: ${auto.length}`);
 
-  console.log('1/3 lendo os artigos…');
-  await pool(auto, CONCURRENCY, async (a) => {
-    try { a.imgs = await imagensDoArtigo(a.redirect); } catch { a.imgs = []; }
-    await sleep(PAUSA);
-  });
-
-  // Segunda tentativa, serial e lenta, para as páginas que o Google recusou.
-  const semPagina = auto.filter((a) => !(a.imgs || []).length);
-  if (semPagina.length) {
-    console.log(`   ${semPagina.length} página(s) falharam — repetindo devagar…`);
-    for (const a of semPagina) {
-      try { a.imgs = await imagensDoArtigo(a.redirect); } catch { a.imgs = []; }
-      await sleep(2000);
-    }
-  }
-
-  // --- 2) A capa é a maior imagem EXCLUSIVA do artigo ---
-  // Imagens que aparecem em muitos artigos são o logo, os ícones e o rodapé do site.
-  const freq = {};
-  auto.forEach((a) => [...new Set((a.imgs || []).map(token))].forEach((t) => { freq[t] = (freq[t] || 0) + 1; }));
-  auto.forEach((a) => {
-    const vistos = new Set();
-    a.cands = (a.imgs || []).filter((u) => {
-      const t = token(u);
-      if (freq[t] > MAX_REPETICOES || vistos.has(t)) return false;
-      vistos.add(t); return true;
-    });
-  });
-
-  console.log('2/3 baixando as capas…');
   const salvar = (a, r) => {
     const ext = r.tipo.includes('png') ? 'png' : r.tipo.includes('webp') ? 'webp' : 'jpg';
     fs.writeFileSync(path.join(deploy, 'img', a.slug + '.' + ext), r.buf);
     a.imagem = DOMAIN + '/img/' + a.slug + '.' + ext;
   };
 
-  await pool(auto, CONCURRENCY, async (a) => {
-    let melhor = null;
-    for (const u of a.cands) {
-      const r = await baixarCandidata(u);
-      if (r && (!melhor || r.buf.length > melhor.buf.length)) melhor = r;
+  // --- 2) Detecção CONSERVADORA da capa (só para artigos sem capa fixa) ---
+  // Regra: na dúvida, NÃO adivinha. É melhor mostrar o card padrão da marca do que a
+  // imagem errada (já aconteceu de pegar foto decorativa em vez da capa).
+  //
+  // Como funciona: lê o artigo e 2 artigos de REFERÊNCIA. Tudo que aparece também nas
+  // referências é "cromo" do site (logo, ícones, rodapé) e é descartado. A capa é a
+  // PRIMEIRA imagem restante (ordem da página) que seja grande e em paisagem.
+  const referencias = arts.filter((a) => a.fixa).slice(0, 2).map((a) => a.redirect);
+
+  if (auto.length) {
+    console.log(`2/3 detectando capa de ${auto.length} artigo(s)…`);
+
+    const cromo = new Set();
+    for (const ref of referencias) {
+      try { (await imagensDoArtigo(ref)).forEach((u) => cromo.add(token(u))); } catch {}
       await sleep(PAUSA);
     }
-    if (melhor) salvar(a, melhor); else a.imagem = '';
-  });
+    console.log(`   referência de cromo: ${cromo.size} imagens do site (logo, rodapé…)`);
 
-  // Terceira tentativa: quem ficou sem capa tenta de novo, bem devagar.
-  const faltando = auto.filter((a) => !a.imagem && a.cands.length);
-  if (faltando.length) {
-    console.log(`   ${faltando.length} capa(s) falharam — repetindo devagar…`);
-    for (const a of faltando) {
-      let melhor = null;
-      for (const u of a.cands) {
+    for (const a of auto) {
+      let imgs = [];
+      try { imgs = await imagensDoArtigo(a.redirect); } catch {}
+      if (!imgs.length) { await sleep(1500); try { imgs = await imagensDoArtigo(a.redirect); } catch {} }
+
+      // candidatas = na ordem da página, sem o cromo e sem repetir
+      const vistos = new Set();
+      const cands = imgs.filter((u) => {
+        const t = token(u);
+        if (cromo.has(t) || vistos.has(t)) return false;
+        vistos.add(t); return true;
+      });
+
+      let capa = null;
+      for (const u of cands) {
         const r = await baixarCandidata(u);
-        if (r && (!melhor || r.buf.length > melhor.buf.length)) melhor = r;
-        await sleep(1500);
+        if (r) { capa = r; break; } // a PRIMEIRA válida é a capa (fica no topo do artigo)
+        await sleep(PAUSA);
       }
-      if (melhor) salvar(a, melhor);
+      if (capa) { salvar(a, capa); console.log(`   capa OK: ${a.slug}`); }
+      else { a.imagem = ''; console.log(`   sem capa: ${a.slug} → usando card padrão`); }
+      await sleep(PAUSA);
     }
   }
 
   console.log('3/3 gerando as páginas…');
-  const semCapa = auto.filter((a) => !a.imagem).map((a) => a.slug);
+
+  // --- 3) Rede de segurança: quem ficou sem capa usa o card padrão da marca ---
+  // Nunca fica sem imagem e nunca mostra imagem errada.
+  const temDefault = fs.existsSync(path.join(deploy, 'img', '_default.jpg'));
+  const usaramDefault = [];
+  arts.forEach((a) => {
+    if (!a.imagem && temDefault) { a.imagem = DOMAIN + '/img/_default.jpg'; usaramDefault.push(a.slug); }
+  });
 
   let count = 0;
   let embedsMd = '# Embeds de compartilhamento (gerados da planilha)\n\n';
@@ -256,6 +252,12 @@ async function baixarCandidata(u) {
   // Google Sites), o endereço continua funcionando em vez de dar 404.
   fs.writeFileSync(path.join(deploy, '_redirects'), '/blog/*  /:splat  301\n');
 
-  if (semCapa.length) console.warn(`AVISO — sem capa detectada (${semCapa.length}): ${semCapa.join(', ')}`);
-  console.log(`OK — ${count} páginas geradas em deploy/ | capas baixadas: ${auto.length - semCapa.length} (domínio: ${DOMAIN})`);
+  if (usaramDefault.length) {
+    console.warn('');
+    console.warn(`  ℹ️  ${usaramDefault.length} artigo(s) estão usando o CARD PADRÃO da marca:`);
+    usaramDefault.forEach((s) => console.warn(`       • ${s}`));
+    console.warn('     Para usar a foto real, salve-a como img/<slug>.jpg no repositório.');
+    console.warn('');
+  }
+  console.log(`OK — ${count} páginas geradas | capas fixas: ${fixas} | detectadas: ${auto.length - usaramDefault.length} | card padrão: ${usaramDefault.length} (domínio: ${DOMAIN})`);
 })();
